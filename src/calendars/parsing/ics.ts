@@ -3,15 +3,15 @@ import { OFCEvent, validateEvent } from "../../types";
 import { DateTime } from "luxon";
 import { rrulestr } from "rrule";
 
-function getDate(t: ical.Time): string {
-    return DateTime.fromSeconds(t.toUnixTime(), { zone: "UTC" }).toISODate();
+function getDate(t: ical.Time, tz: ical.Timezone): string {
+    return DateTime.fromSeconds(t.toUnixTime()).setZone(tz.tzid).toISODate();
 }
 
-function getTime(t: ical.Time): string {
+function getTime(t: ical.Time, tz: ical.Timezone): string {
     if (t.isDate) {
         return "00:00";
     }
-    return DateTime.fromSeconds(t.toUnixTime(), { zone: "UTC" }).toISOTime({
+    return DateTime.fromSeconds(t.toUnixTime()).setZone(tz.tzid).toISOTime({
         includeOffset: false,
         includePrefix: false,
         suppressMilliseconds: true,
@@ -24,6 +24,26 @@ function extractEventUrl(iCalEvent: ical.Event): string {
     return urlProp ? urlProp.getFirstValue() : "";
 }
 
+// NOTE: Google Calendar uses this ICAL property to specify a timezone for its events.
+const GCAL_TZID_PROP_NAME = "x-wr-timezone";
+
+function extractTimezone(calComponent: ical.Component): ical.Timezone {
+    if (calComponent.hasProperty(GCAL_TZID_PROP_NAME)) {
+        const tzid = calComponent.getFirstPropertyValue(GCAL_TZID_PROP_NAME);
+        for (const component of calComponent.getAllSubcomponents("vtimezone")) {
+            if (component.getFirstPropertyValue("tzid") === tzid) {
+                return new ical.Timezone({ component });
+            }
+        }
+        return new ical.Timezone({ tzid, component: "" });
+    } else {
+        const component = calComponent.getFirstSubcomponent("vtimezone");
+        return component
+            ? new ical.Timezone({ component })
+            : ical.Timezone.utcTimezone;
+    }
+}
+
 function specifiesEnd(iCalEvent: ical.Event) {
     return (
         Boolean(iCalEvent.component.getFirstProperty("dtend")) ||
@@ -31,63 +51,57 @@ function specifiesEnd(iCalEvent: ical.Event) {
     );
 }
 
-function icsToOFC(input: ical.Event): OFCEvent {
+function icsToOFC(input: ical.Event, tz: ical.Timezone): OFCEvent {
+    const allDay = input.startDate.isDate;
+    if (allDay) {
+        tz = ical.Timezone.utcTimezone;
+    }
+
     if (input.isRecurring()) {
         const rrule = rrulestr(
             input.component.getFirstProperty("rrule").getFirstValue().toString()
         );
-        const allDay = input.startDate.isDate;
         const exdates = input.component
             .getAllProperties("exdate")
             .map((exdateProp) => {
                 const exdate = exdateProp.getFirstValue();
                 // NOTE: We only store the date from an exdate and recreate the full datetime exdate later,
                 // so recurring events with exclusions that happen more than once per day are not supported.
-                return getDate(exdate);
+                return getDate(exdate, tz);
             });
 
         return {
             type: "rrule",
             title: input.summary,
-            id: `ics::${input.uid}::${getDate(input.startDate)}::recurring`,
+            id: `ics::${input.uid}::${getDate(input.startDate, tz)}::recurring`,
             rrule: rrule.toString(),
             skipDates: exdates,
-            startDate: getDate(
-                input.startDate.convertToZone(ical.Timezone.utcTimezone)
-            ),
+            startDate: getDate(input.startDate, tz),
             ...(allDay
                 ? { allDay: true }
                 : {
                       allDay: false,
-                      startTime: getTime(
-                          input.startDate.convertToZone(
-                              ical.Timezone.utcTimezone
-                          )
-                      ),
-                      endTime: getTime(
-                          input.endDate.convertToZone(ical.Timezone.utcTimezone)
-                      ),
+                      startTime: getTime(input.startDate, tz),
+                      endTime: input.endDate
+                          ? getTime(input.endDate, tz)
+                          : null,
                   }),
         };
     } else {
-        const date = getDate(input.startDate);
-        const endDate =
-            specifiesEnd(input) && input.endDate
-                ? getDate(input.endDate)
-                : undefined;
-        const allDay = input.startDate.isDate;
+        const date = getDate(input.startDate, tz);
+        const endDate = specifiesEnd(input) ? getDate(input.endDate, tz) : null;
         return {
             type: "single",
             id: `ics::${input.uid}::${date}::single`,
             title: input.summary,
             date,
-            endDate: date !== endDate ? endDate || null : null,
+            endDate: date !== endDate ? endDate : null,
             ...(allDay
                 ? { allDay: true }
                 : {
                       allDay: false,
-                      startTime: getTime(input.startDate),
-                      endTime: getTime(input.endDate),
+                      startTime: getTime(input.startDate, tz),
+                      endTime: getTime(input.endDate, tz),
                   }),
         };
     }
@@ -96,10 +110,7 @@ function icsToOFC(input: ical.Event): OFCEvent {
 export function getEventsFromICS(text: string): OFCEvent[] {
     const jCalData = ical.parse(text);
     const component = new ical.Component(jCalData);
-
-    // TODO: Timezone support
-    // const tzc = component.getAllSubcomponents("vtimezone");
-    // const tz = new ical.Timezone(tzc[0]);
+    const tz = extractTimezone(component);
 
     const events: ical.Event[] = component
         .getAllSubcomponents("vevent")
@@ -121,12 +132,12 @@ export function getEventsFromICS(text: string): OFCEvent[] {
     const baseEvents = Object.fromEntries(
         events
             .filter((e) => e.recurrenceId === null)
-            .map((e) => [e.uid, icsToOFC(e)])
+            .map((e) => [e.uid, icsToOFC(e, tz)])
     );
 
     const recurrenceExceptions = events
         .filter((e) => e.recurrenceId !== null)
-        .map((e): [string, OFCEvent] => [e.uid, icsToOFC(e)]);
+        .map((e): [string, OFCEvent] => [e.uid, icsToOFC(e, tz)]);
 
     for (const [uid, event] of recurrenceExceptions) {
         const baseEvent = baseEvents[uid];
